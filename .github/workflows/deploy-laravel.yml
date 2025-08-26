@@ -1,0 +1,124 @@
+name: Deploy Backend
+
+on:
+  push:
+    branches: [main, staging]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      REGISTRY: ghcr.io
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set repository name lowercase
+        id: repo_lc
+        run: echo "REPO_LC=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate .env for Docker build
+        run: |
+          cat <<EOF > .env
+          APP_NAME=Laravel
+          APP_ENV=local
+          APP_KEY=base64:dummykey1234567890==
+          APP_DEBUG=true
+          APP_URL=http://localhost
+          DB_CONNECTION=pgsql
+          DB_HOST=db
+          DB_PORT=5432
+          DB_DATABASE=laravel
+          DB_USERNAME=laravel
+          DB_PASSWORD=your_secure_password
+          EOF
+      - name: Build and push backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ env.REPO_LC }}/backend:latest
+            ghcr.io/${{ env.REPO_LC }}/backend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy to VPS via SSH
+        uses: appleboy/ssh-action@v0.1.8
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            BRANCH_NAME="${{ github.ref_name }}"
+            if [ "$BRANCH_NAME" = "staging" ]; then
+              APP_PATH="/root/apps/staging-backend"
+            else
+              APP_PATH="/root/apps/production-backend"
+            fi
+            mkdir -p $APP_PATH
+            cd $APP_PATH
+            echo "${{ secrets.VPS_DEPLOY_KEY }}" > /tmp/deploy-key
+            chmod 600 /tmp/deploy-key
+            export GIT_SSH_COMMAND='ssh -i /tmp/deploy-key -o StrictHostKeyChecking=no'
+            if [ ! -d .git ]; then
+              git clone https://github.com/Yosinan/laravel-template .
+            else
+              git pull origin ${GITHUB_REF##*/}
+            fi
+            echo "${{ secrets.VPS_DOCKER_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            
+            cd ..
+            docker compose pull
+            docker compose -f docker-compose.yml -f docker-compose.staging.yml up test_app -d
+            docker compose -f docker-compose.yml exec app php artisan migrate --force
+            docker compose -f docker-compose.yml exec app php artisan config:cache
+            
+  notify:
+    needs: deploy
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set Notification Message
+        id: set_message
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" && "${{ github.event.pull_request.merged }}" == "true" ]]; then
+            echo "msg=🔀 *Pull Request Merged!* ${{ github.actor }}* merged PR: _${{ github.event.pull_request.title }}_" >> $GITHUB_OUTPUT
+            echo "url=${{ github.event.pull_request.html_url }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ needs.deploy.result }}" == "success" ]]; then
+            echo "msg=✅ *Laravel Deployment Successful!* \n _Your changes are live on the server._ 🚀" >> $GITHUB_OUTPUT
+            echo "url=https://lms.siltawi.com" >> $GITHUB_OUTPUT         
+          else
+            echo "msg=❌ *Deployment Failed!* \n Check the CI logs to fix the issue. 🔧" >> $GITHUB_OUTPUT
+            echo "url=https://github.com/gashadigital/siltawi-lms-backend/actions" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Notify on Telegram
+        run: |
+            curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage \
+            -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
+            -d message_thread_id=${{ secrets.MESSAGE_THREAD_ID }} \
+            -d parse_mode=Markdown \
+            -d text="${{ steps.set_message.outputs.msg }}" \
+            --data-urlencode 'reply_markup={
+              "inline_keyboard": [
+                [
+                  { "text": "🌐 View", "url": "${{ steps.set_message.outputs.url }}" },
+                  { "text": "📂 View Repo", "url": "https://github.com/gashadigital/siltawi-lms-backend" }
+                ]
+              ]
+            }'
