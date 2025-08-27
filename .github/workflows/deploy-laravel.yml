@@ -84,7 +84,7 @@ jobs:
 
             cd ..
             docker compose pull
-            docker compose -f docker-compose.yml -f docker-compose.staging.yml up test_app -d
+            docker compose -f docker-compose.yml -f docker-compose.staging.yml up -d
             docker compose -f docker-compose.yml exec app php artisan migrate --force
             docker compose -f docker-compose.yml exec app php artisan config:cache
 
